@@ -1,0 +1,16 @@
+[project]
+name = "quote-system"
+version = "0.1.0"
+description = "本地报价查询与匹配系统"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "flask>=3.1.3",
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.0",
+    "pywebview>=5.4",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+quote-system = "ui:main"
+quote-system-ui = "ui:main"
