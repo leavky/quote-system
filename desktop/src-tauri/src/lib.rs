@@ -65,32 +65,29 @@ fn default_paths(app: tauri::AppHandle) -> Result<DefaultPaths, String> {
         .ok_or_else(|| "无法定位项目目录".to_string())?;
     let resource_dir = app.path().resource_dir().ok();
     let external_dirs = external_data_dirs();
-    let quote_root = root
-        .parent()
-        .ok_or_else(|| "无法定位报价系统目录".to_string())?;
     let ledger_path = resolve_default_file(
         "zc检测费用台帐明细20260725.xls",
         &external_dirs,
         resource_dir.as_deref(),
-        root.join("zc检测费用台帐明细20260725.xls"),
+        root.join("data").join("zc检测费用台帐明细20260725.xls"),
     );
     let price_path = resolve_default_file(
         "检测项目结算计费价格汇总.xlsx",
         &external_dirs,
         resource_dir.as_deref(),
-        root.join("检测项目结算计费价格汇总.xlsx"),
+        root.join("data").join("检测项目结算计费价格汇总.xlsx"),
     );
     let quote_price_path = resolve_default_file(
         "检测报价表.xlsx",
         &external_dirs,
         resource_dir.as_deref(),
-        quote_root.join("检测报价表.xlsx"),
+        root.join("data").join("检测报价表.xlsx"),
     );
     let quote_template_path = resolve_default_file(
         "报价清单导入模板.xlsx",
         &external_dirs,
         resource_dir.as_deref(),
-        quote_root.join("报价清单导入模板.xlsx"),
+        root.join("data").join("报价清单导入模板.xlsx"),
     );
     Ok(DefaultPaths {
         ledger_path: ledger_path.to_string_lossy().to_string(),

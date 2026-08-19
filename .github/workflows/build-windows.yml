@@ -14,7 +14,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: 项目结算价格匹配/desktop
+        working-directory: desktop
 
     steps:
       - name: Checkout repository
@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: 项目结算价格匹配/desktop/package-lock.json
+          cache-dependency-path: desktop/package-lock.json
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: 项目结算价格匹配/desktop/src-tauri
+          workspaces: desktop/src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
@@ -55,7 +55,7 @@ jobs:
         with:
           name: 报价系统-Windows-${{ github.ref_name }}
           path: |
-            项目结算价格匹配/desktop/artifacts/portable/
-            项目结算价格匹配/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/artifacts/portable/
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 30

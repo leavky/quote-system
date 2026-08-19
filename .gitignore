@@ -17,3 +17,6 @@ output/
 *.log
 *.xls
 *.xlsx
+
+data/*
+!data/.gitkeep

@@ -6,10 +6,16 @@
 - 报价匹配
 - 价格维护
 
+## 目录结构
+
+- `desktop/`：当前 React + Tauri 桌面应用
+- `legacy-python/`：旧版 Python 报价程序，独立保留
+- `data/`：本地业务 Excel，不提交到 GitHub
+
 ## 本地开发
 
 ```bash
-cd 项目结算价格匹配/desktop
+cd desktop
 npm ci
 npm run desktop:dev
 ```

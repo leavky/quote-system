@@ -5,7 +5,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-OUTPUT = BASE_DIR / "报价清单导入模板.xlsx"
+OUTPUT = BASE_DIR / "data" / "报价清单导入模板.xlsx"
+OUTPUT.parent.mkdir(exist_ok=True)
 
 # ── 列定义 ────────────────────────────────────────────────
 # (表头文字, 宽度, 说明, 必填)

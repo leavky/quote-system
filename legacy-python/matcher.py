@@ -20,10 +20,11 @@ def base_dir() -> Path:
 
 
 BASE_DIR = base_dir()
+DATA_DIR = next((path for path in (BASE_DIR.parent / "data", BASE_DIR / "data") if path.is_dir()), BASE_DIR.parent / "data")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
-DEFAULT_PRICE = BASE_DIR / "检测报价表.xlsx"
-QUOTE_TEMPLATE = BASE_DIR / "报价清单导入模板.xlsx"
+DEFAULT_PRICE = DATA_DIR / "检测报价表.xlsx"
+QUOTE_TEMPLATE = DATA_DIR / "报价清单导入模板.xlsx"
 
 
 PRICE_COLUMNS = {
