@@ -31,6 +31,7 @@ import {
 import {
   applyQuoteManualMatch,
   appendQuotePriceAliases,
+  backfillQuoteWorkbook,
   buildQuoteMatchPayload,
   createQuoteImportTemplate,
   exportQuoteMatches,
@@ -46,7 +47,7 @@ import {
 import './App.css'
 
 type DefaultPaths = { ledger_path: string; price_path: string; quote_price_path: string; quote_template_path: string }
-type BusyAction = '' | 'initial' | 'match' | 'priority' | 'export' | 'quoteMatch' | 'quoteExport' | 'quoteTemplate'
+type BusyAction = '' | 'initial' | 'match' | 'priority' | 'export' | 'quoteMatch' | 'quoteExport' | 'quoteBackfill' | 'quoteTemplate'
 type ModuleKey = 'projectPrice' | 'quoteMatch' | 'priceBook'
 
 const statusClass: Record<string, string> = {
@@ -57,10 +58,20 @@ const statusClass: Record<string, string> = {
   无可用价格: 'secondary',
 }
 
+const quoteStatusClass: Record<string, string> = {
+  已关联: 'success',
+  报价编号未找到: 'danger',
+  报价编号重复: 'warning',
+  结算编号缺失: 'secondary',
+}
+
 const fmtMoney = (value: number | null | undefined) =>
   value === null || value === undefined ? '' : value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
+const joinDistinct = (...values: Array<string | null | undefined>) => Array.from(new Set(values.flatMap((value) => value ? value.split(/[、,，]/).map((item) => item.trim()) : []).filter(Boolean))).join('、')
+
 const basename = (path: string) => path.split(/[\\/]/).pop() || path
+const normalizedFilePath = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
 type SettlementEditDraft = {
   unit_price: string
@@ -105,6 +116,7 @@ function App() {
   const [priceBookBusy, setPriceBookBusy] = useState(false)
   const [settlementEditId, setSettlementEditId] = useState('')
   const [settlementEditDraft, setSettlementEditDraft] = useState<SettlementEditDraft | null>(null)
+  const [correspondenceRowId, setCorrespondenceRowId] = useState('')
   const loading = busyAction !== ''
 
   async function pickFile(kind: 'ledger' | 'price' | 'quote' | 'quotePrice') {
@@ -113,7 +125,10 @@ function App() {
       filters: [{ name: 'Excel', extensions: kind === 'quote' || kind === 'quotePrice' ? ['xlsx'] : ['xls', 'xlsx'] }],
     })
     if (typeof selected !== 'string') return
-    if (kind === 'ledger') setLedgerPath(selected)
+    if (kind === 'ledger') {
+      setLedgerPath(selected)
+      if (pricePath) await loadMatch(undefined, 'match', { ledger: selected, price: pricePath })
+    }
     else if (kind === 'price') {
       setPricePath(selected)
       setSettlementBook(null)
@@ -121,6 +136,7 @@ function App() {
         setPriceBookBusy(true)
         try { setSettlementBook(await loadSettlementPriceBook(selected)) } catch (err) { setError(readError(err)) } finally { setPriceBookBusy(false) }
       }
+      if (ledgerPath) await loadMatch(undefined, 'match', { ledger: ledgerPath, price: selected })
     } else if (kind === 'quotePrice') {
       setQuotePricePath(selected)
       setQuoteBook([])
@@ -131,17 +147,27 @@ function App() {
     } else setQuotePath(selected)
   }
 
-  async function loadMatch(nextPriority?: PriorityEntry[], action: BusyAction = 'match') {
-    if (!ledgerPath || !pricePath) {
+  async function loadMatch(
+    nextPriority?: PriorityEntry[],
+    action: BusyAction = 'match',
+    sourcePaths?: { ledger: string; price: string },
+  ) {
+    const activeLedgerPath = sourcePaths?.ledger || ledgerPath
+    const activePricePath = sourcePaths?.price || pricePath
+    if (!activeLedgerPath || !activePricePath) {
       setError('请先选择台账明细表和计费价格汇总表')
       return
     }
     setBusyAction(action)
     setError('')
     try {
-      const basePayload = nextPriority && data ? repricePayload(data, nextPriority) : await buildMatchPayload(ledgerPath, pricePath)
+      const basePayload = nextPriority && data && !sourcePaths
+        ? repricePayload(data, nextPriority)
+        : await buildMatchPayload(activeLedgerPath, activePricePath, quotePricePath)
       const activePriority = nextPriority || buildPriorityOrder(basePayload.result.systems, priorityTopName)
-      const payload = nextPriority && data ? basePayload : activePriority.length ? repricePayload(basePayload, activePriority) : basePayload
+      const payload = nextPriority && data && !sourcePaths
+        ? basePayload
+        : activePriority.length ? repricePayload(basePayload, activePriority) : basePayload
       setData(payload)
       if (payload.priority.length) setPriorityTopName(payload.priority[0].name)
     } catch (err) {
@@ -200,8 +226,35 @@ function App() {
     if (!target) return
     setBusyAction('quoteExport')
     setError('')
+    setNotice('')
     try {
-      await exportQuoteMatches(quoteData, target)
+      const count = await exportQuoteMatches(quoteData, target)
+      setNotice(`已导出 ${count} 条报价匹配结果`)
+    } catch (err) {
+      setError(readError(err))
+    } finally {
+      setBusyAction('')
+    }
+  }
+
+  async function backfillQuoteRows() {
+    if (!quoteData || !quotePath) return
+    const quoteName = basename(quotePath).replace(/\.xlsx$/i, '')
+    const target = await save({
+      defaultPath: `${quoteName}-报价回填.xlsx`,
+      filters: [{ name: 'Excel', extensions: ['xlsx'] }],
+    })
+    if (!target) return
+    if (normalizedFilePath(target) === normalizedFilePath(quotePath)) {
+      setError('回填结果不能覆盖原报价清单，请选择新的保存位置')
+      return
+    }
+    setBusyAction('quoteBackfill')
+    setError('')
+    setNotice('')
+    try {
+      const count = await backfillQuoteWorkbook(quotePath, quoteData, target)
+      setNotice(`已回填 ${count} 行到原报价清单副本`)
     } catch (err) {
       setError(readError(err))
     } finally {
@@ -252,13 +305,24 @@ function App() {
     setError('')
     setNotice('')
     try {
-      if (priceBookTab === 'settlement' && settlementBook) {
-        const changed = await updateSettlementPriceBook(pricePath, settlementBook.items.map((item) => ({ sheet: item.sheet, row_number: item.row_number, prices: item.prices })))
-        setNotice(changed ? `已保存 ${changed} 行结算价格，返回项目价格匹配后重新匹配即可生效` : '没有检测到价格变更')
-      } else {
-        const changed = await updateQuotePriceBook(quotePricePath, quoteBook.map((item) => ({ sheet: item.sheet, row_number: item.row_number, price: item.price, remark: item.remark })))
-        setNotice(changed ? `已保存 ${changed} 行报价库数据，下一次报价匹配将使用新价格` : '没有检测到价格变更')
-      }
+      let settlementChanged = 0
+      let quoteChanged = 0
+      if (settlementBook && pricePath) settlementChanged = await updateSettlementPriceBook(pricePath, settlementBook.items.map((item) => ({ sheet: item.sheet, row_number: item.row_number, code: item.code, prices: item.prices })))
+      if (quoteBook.length && quotePricePath) quoteChanged = await updateQuotePriceBook(quotePricePath, quoteBook.map((item) => ({
+        sheet: item.sheet,
+        row_number: item.row_number,
+        seq: item.seq,
+        code: item.code,
+        category: item.category,
+        material: item.material,
+        parameter: item.parameter,
+        unit: item.unit,
+        price: item.price,
+        remark: item.remark,
+        project_aliases: item.project_aliases,
+        parameter_aliases: item.parameter_aliases,
+      })))
+      setNotice(settlementChanged || quoteChanged ? `已保存结算表 ${settlementChanged} 行、报价库 ${quoteChanged} 行修改` : '没有检测到价格变更')
     } catch (err) {
       setError(readError(err))
     } finally {
@@ -336,9 +400,17 @@ function App() {
     if (row && quotePricePath) {
       try {
         const learnResult = await appendQuotePriceAliases(quotePricePath, item, row.sample_name, row.parameter || row.project_name)
-        payload = markQuoteAliasLearned(payload, activeMatchId, learnResult)
+        payload = markQuoteAliasLearned(payload, activeMatchId, item, learnResult)
+        setNotice(learnResult.updated ? `已确认匹配，并将别名回填到报价库：${learnResult.message}` : `已确认匹配：${learnResult.message}`)
       } catch (err) {
-        payload = markQuoteAliasLearned(payload, activeMatchId, { updated: false, message: readError(err) })
+        const message = readError(err)
+        payload = markQuoteAliasLearned(payload, activeMatchId, item, {
+          updated: false,
+          message,
+          project_aliases: item.project_aliases,
+          parameter_aliases: item.parameter_aliases,
+        })
+        setError(`匹配已确认，但别名回填失败：${message}`)
       }
     }
     setQuoteData(payload)
@@ -355,7 +427,7 @@ function App() {
         setQuotePricePath(defaults.quote_price_path)
         setQuoteTemplatePath(defaults.quote_template_path)
         if (defaults.ledger_path && defaults.price_path) {
-          const payload = await buildMatchPayload(defaults.ledger_path, defaults.price_path)
+          const payload = await buildMatchPayload(defaults.ledger_path, defaults.price_path, defaults.quote_price_path)
           setData(payload)
           if (payload.priority.length) setPriorityTopName(payload.priority[0].name)
         }
@@ -391,7 +463,7 @@ function App() {
       if (project && !row.project_name.toLowerCase().includes(project)) return false
       if (item && !row.billing_item.toLowerCase().includes(item)) return false
       if (!keyword) return true
-      return [row.report_number, row.project_name, row.unit_project, row.client_name, row.report_category, row.billing_item, row.matched_code, row.status]
+      return [row.report_number, row.project_name, row.unit_project, row.client_name, row.report_category, row.billing_item, row.matched_code, row.quote_project, row.quote_material, row.quote_parameter, row.quote_status, row.status]
         .join(' ')
         .toLowerCase()
         .includes(keyword)
@@ -420,6 +492,7 @@ function App() {
   }, [quoteData, quoteStatusFilter])
   const quotePickRow = useMemo(() => quoteData?.matches.find((row) => row.id === quotePickId) || null, [quoteData, quotePickId])
   const settlementEditRow = useMemo(() => data?.records.find((row) => row.id === settlementEditId) || null, [data, settlementEditId])
+  const correspondenceRow = useMemo(() => data?.records.find((row) => row.id === correspondenceRowId) || null, [data, correspondenceRowId])
   const quoteCandidates = useMemo(() => {
     if (!quoteData || !quotePickRow) return []
     return rankQuotePriceItemsForLine(quoteData.price_items, quotePickRow, {
@@ -618,24 +691,20 @@ function App() {
         <div className="table-wrap">
           <table>
             <thead>
+              <tr className="result-group-row">
+                <th colSpan={7}>zc台账数据</th>
+                <th colSpan={4}>结算表数据</th>
+                <th colSpan={7}>报价表数据</th>
+              </tr>
               <tr>
-                <th>委托日期</th>
-                <th>报告编号</th>
-                <th>工程名称</th>
-                <th>报告类别</th>
-                <th>计费项目</th>
-                <th className="num">数量</th>
-                <th className="num">台账单价</th>
-                <th>价格体系</th>
-                <th className="num">结算单价</th>
-                <th className="num">结算金额</th>
-                <th>项目编号</th>
-                <th>状态</th>
+                <th>委托日期</th><th>报告编号</th><th>工程名称</th><th>报告类别</th><th>计费项目</th><th className="num">数量</th><th className="num">台账单价</th>
+                <th>价格体系</th><th className="num">结算单价</th><th className="num">结算金额</th><th>计费项目编号</th>
+                <th>报价编号</th><th>报价检测项目（含别名）</th><th>检测材料</th><th>报价检测参数（含别名）</th><th className="num">报价单价</th><th>报价关联</th><th>状态</th>
               </tr>
             </thead>
             <tbody>
               {pagedRows.map((row) => (
-                <tr className="editable-result-row" key={row.id} onClick={() => openSettlementEditor(row)}>
+                <tr className="editable-result-row" key={row.id} onClick={() => setCorrespondenceRowId(row.id)} onDoubleClick={() => openSettlementEditor(row)}>
                   <td>{row.date}</td>
                   <td>{row.report_number}</td>
                   <td className="wide">{row.project_name}</td>
@@ -647,6 +716,16 @@ function App() {
                   <td className="num">{fmtMoney(row.selected_price)}</td>
                   <td className="num">{fmtMoney(row.settlement_amount)}</td>
                   <td>{row.matched_code}</td>
+                  <td>{row.quote_code || '-'}</td>
+                  <td className="wide">{joinDistinct(row.quote_project, row.quote_project_alias) || '-'}</td>
+                  <td className="wide">{row.quote_material || '-'}</td>
+                  <td className="wide">{joinDistinct(row.quote_parameter, row.quote_parameter_alias) || '-'}</td>
+                  <td className="num">{fmtMoney(row.quote_price)}</td>
+                  <td>
+                    <Chip className={`status-chip status-chip-${quoteStatusClass[row.quote_status] || 'default'}`} size="sm" color={(quoteStatusClass[row.quote_status] || 'default') as never} variant="soft">
+                      {row.quote_status || '未检查'}
+                    </Chip>
+                  </td>
                   <td>
                     <Chip className={`status-chip status-chip-${statusClass[row.status] || 'default'}`} size="sm" color={(statusClass[row.status] || 'default') as never} variant="soft">
                       {row.manual_match && row.status === '已匹配' ? '手动匹配' : row.status}
@@ -655,7 +734,7 @@ function App() {
                 </tr>
               ))}
               {!filtered.length && (
-                <tr><td className="empty" colSpan={12}>没有符合条件的记录</td></tr>
+                <tr><td className="empty" colSpan={18}>没有符合条件的记录</td></tr>
               )}
             </tbody>
           </table>
@@ -704,7 +783,10 @@ function App() {
                     {busyAction === 'quoteTemplate' ? '保存中' : '下载导入模板'}
                   </Button>
                   <Button type="button" size="sm" variant="primary" onPress={exportQuoteRows} isDisabled={!quoteData || loading}>
-                    {busyAction === 'quoteExport' ? '导出中' : '下载结果'}
+                    {busyAction === 'quoteExport' ? '导出中' : '导出匹配结果'}
+                  </Button>
+                  <Button type="button" size="sm" variant="primary" onPress={backfillQuoteRows} isDisabled={!quoteData || loading}>
+                    {busyAction === 'quoteBackfill' ? '回填中' : '回填原清单'}
                   </Button>
                 </div>
               </div>
@@ -760,8 +842,13 @@ function App() {
                       <td className="num">{row.quantity ?? ''}</td>
                       <td className="num">{row.matched_price_text || fmtMoney(row.matched_price)}</td>
                       <td className="num">{fmtMoney(row.calculated_total)}</td>
-                      <td className="wide">{row.matched?.remark || row.remark}</td>
-                      <td><QuoteStatusChip row={row} /></td>
+                      <td className="wide">{row.matched?.remark || row.matched_remark || row.remark}</td>
+                      <td>
+                        <div className="quote-status-stack">
+                          <QuoteStatusChip row={row} />
+                          {row.alias_learned && <small title={row.alias_message}>别名已回填</small>}
+                        </div>
+                      </td>
                       <td>
                         <Button type="button" size="sm" variant={row.matched ? 'secondary' : 'primary'} onPress={() => openQuotePicker(row)}>
                           {row.matched_label || '选择匹配项'}
@@ -801,6 +888,7 @@ function App() {
 
       {quotePickRow && quoteData && (
         <QuoteMatchDialog
+          key={quotePickRow.id}
           candidates={quoteCandidates}
           mode={quotePickMode}
           query={quotePickQuery}
@@ -823,19 +911,22 @@ function App() {
           onSave={saveSettlementEdit}
         />
       )}
+      {correspondenceRow && (
+        <CorrespondenceDialog row={correspondenceRow} onClose={() => setCorrespondenceRowId('')} />
+      )}
     </main>
   )
 }
 
 function PriceBookModule({
-  activeTab,
+  activeTab: _activeTab,
   settlementBook,
   quoteBook,
   pricePath,
   quotePricePath,
   query,
   busy,
-  onTabChange,
+  onTabChange: _onTabChange,
   onQueryChange,
   onSave,
   onSettlementChange,
@@ -858,11 +949,29 @@ function PriceBookModule({
   onPickSettlement: () => void
   onPickQuote: () => void
 }) {
-  const [editing, setEditing] = useState<{ kind: 'settlement'; item: PriceItem } | { kind: 'quote'; item: QuotePriceItem } | null>(null)
+  type MergedPriceEditing = {
+    settlement: PriceItem
+    quote: QuotePriceItem | null
+  }
+  const [editing, setEditing] = useState<MergedPriceEditing | null>(null)
   const [draftPrices, setDraftPrices] = useState<Record<string, string>>({})
   const [draftRemark, setDraftRemark] = useState('')
-  const settlementRows = (settlementBook?.items || []).filter((item) => !query || [item.report_category, item.billing_item, item.code, item.category].join(' ').toLowerCase().includes(query.toLowerCase()))
-  const quoteRows = quoteBook.filter((item) => !query || item.search_text.toLowerCase().includes(query.toLowerCase()))
+  const [draftQuote, setDraftQuote] = useState({ seq: '', code: '', category: '', material: '', parameter: '', unit: '', projectAliases: '', parameterAliases: '' })
+  const mergedRows = useMemo(() => {
+    const quoteByCode = new Map<string, QuotePriceItem[]>()
+    quoteBook.forEach((item) => {
+      if (!item.code) return
+      quoteByCode.set(item.code, [...(quoteByCode.get(item.code) || []), item])
+    })
+    const rows = (settlementBook?.items || []).map((settlement) => ({
+      settlement,
+      quotes: settlement.code ? quoteByCode.get(settlement.code) || [] : [],
+    }))
+    return rows.filter(({ settlement, quotes }) => {
+      if (!query) return true
+      return [settlement.category, settlement.report_category, settlement.billing_item, settlement.code, ...quotes.flatMap((item) => [item.category, item.material, item.parameter, item.code])].join(' ').toLowerCase().includes(query.toLowerCase())
+    })
+  }, [query, quoteBook, settlementBook])
   const parsePriceDraft = (raw: string) => {
     const value = raw.trim()
     if (!/^-?\d*(?:\.\d*)?$/.test(value)) return null
@@ -870,71 +979,82 @@ function PriceBookModule({
     const parsed = Number(value)
     return Number.isFinite(parsed) ? parsed : null
   }
-  function openSettlementEditor(item: PriceItem) {
-    setEditing({ kind: 'settlement', item })
-    setDraftPrices(Object.fromEntries((settlementBook?.systems || []).map((system) => [system.name, item.prices[system.name] === null ? '' : String(item.prices[system.name] ?? '')])))
+  function openMergedEditor(settlement: PriceItem, quote: QuotePriceItem | null) {
+    setEditing({ settlement, quote })
+    setDraftPrices({
+      ...Object.fromEntries((settlementBook?.systems || []).map((system) => [system.name, settlement.prices[system.name] === null ? '' : String(settlement.prices[system.name] ?? '')])),
+      quote: quote?.price === null || !quote ? '' : String(quote.price ?? ''),
+    })
+    setDraftRemark(quote?.remark || '')
+    setDraftQuote({
+      seq: quote?.seq || '',
+      code: quote?.code || '',
+      category: quote?.category || '',
+      material: quote?.material || '',
+      parameter: quote?.parameter || '',
+      unit: quote?.unit || '',
+      projectAliases: quote?.project_aliases.join('、') || '',
+      parameterAliases: quote?.parameter_aliases.join('、') || '',
+    })
   }
-  function openQuoteEditor(item: QuotePriceItem) {
-    setEditing({ kind: 'quote', item })
-    setDraftPrices({ quote: item.price === null ? '' : String(item.price ?? '') })
-    setDraftRemark(item.remark)
-  }
-  function closeEditor() { setEditing(null); setDraftPrices({}); setDraftRemark('') }
+  function closeEditor() { setEditing(null); setDraftPrices({}); setDraftRemark(''); setDraftQuote({ seq: '', code: '', category: '', material: '', parameter: '', unit: '', projectAliases: '', parameterAliases: '' }) }
   function applyEditor() {
     if (!editing) return
-    if (editing.kind === 'settlement' && settlementBook) {
-      onSettlementChange({ ...settlementBook, items: settlementBook.items.map((item) => item.sheet === editing.item.sheet && item.row_number === editing.item.row_number ? { ...item, prices: Object.fromEntries(settlementBook.systems.map((system) => [system.name, parsePriceDraft(draftPrices[system.name] || '')])) } : item) })
-    } else if (editing.kind === 'quote') {
+    if (settlementBook) {
+      onSettlementChange({ ...settlementBook, items: settlementBook.items.map((item) => item.sheet === editing.settlement.sheet && item.row_number === editing.settlement.row_number ? { ...item, code: editing.quote ? draftQuote.code : item.code, prices: Object.fromEntries(settlementBook.systems.map((system) => [system.name, parsePriceDraft(draftPrices[system.name] || '')])) } : item) })
+    }
+    if (editing.quote) {
       const raw = draftPrices.quote || ''
-      onQuoteChange(quoteBook.map((item) => item.sheet === editing.item.sheet && item.row_number === editing.item.row_number ? { ...item, price: parsePriceDraft(raw), raw_price: raw, remark: draftRemark } : item))
+      const splitDraftAliases = (value: string) => value.split(/[、,，;；/|｜\n]+/).map((item) => item.trim()).filter(Boolean)
+      const projectAliases = splitDraftAliases(draftQuote.projectAliases)
+      const parameterAliases = splitDraftAliases(draftQuote.parameterAliases)
+      onQuoteChange(quoteBook.map((item) => item.sheet === editing.quote!.sheet && item.row_number === editing.quote!.row_number ? {
+        ...item,
+        seq: draftQuote.seq,
+        code: draftQuote.code,
+        category: draftQuote.category,
+        material: draftQuote.material,
+        parameter: draftQuote.parameter,
+        unit: draftQuote.unit,
+        price: parsePriceDraft(raw),
+        raw_price: raw,
+        remark: draftRemark,
+        project_aliases: projectAliases,
+        parameter_aliases: parameterAliases,
+        aliases: [...projectAliases, ...parameterAliases],
+        search_text: [item.sheet, draftQuote.category, draftQuote.material, draftQuote.parameter, ...projectAliases, ...parameterAliases].join(' '),
+      } : item))
     }
     closeEditor()
   }
   function editingTitle() {
     if (!editing) return ''
-    if (editing.kind === 'settlement') return `${editing.item.category || editing.item.sheet} / ${editing.item.billing_item || '-'}`
-    return `${editing.item.category || editing.item.sheet} / ${editing.item.parameter || '-'}`
+    return `${editing.settlement.category || editing.settlement.sheet} / ${editing.settlement.billing_item || '-'}`
   }
   return (
     <section className="price-book-module">
       <Card className="panel price-book-panel">
-        <div className="price-book-tabs" role="tablist">
-          <button className={activeTab === 'settlement' ? 'active' : ''} type="button" role="tab" aria-selected={activeTab === 'settlement'} onClick={() => onTabChange('settlement')}>结算价格体系</button>
-          <button className={activeTab === 'quote' ? 'active' : ''} type="button" role="tab" aria-selected={activeTab === 'quote'} onClick={() => onTabChange('quote')}>报价库</button>
-        </div>
+        <div className="price-book-tabs" role="tablist"><button className="active" type="button" role="tab" aria-selected="true">统一项目价格表</button></div>
         <div className="price-book-source">
-          <span>{activeTab === 'settlement' ? (pricePath ? basename(pricePath) : '尚未选择结算价格表') : (quotePricePath ? basename(quotePricePath) : '尚未选择报价库')}</span>
-          <Button type="button" size="sm" variant="secondary" onPress={activeTab === 'settlement' ? onPickSettlement : onPickQuote}>{activeTab === 'settlement' ? '选择结算价格表' : '选择报价库'}</Button>
+          <span>{pricePath ? basename(pricePath) : '尚未选择结算价格表'} + {quotePricePath ? basename(quotePricePath) : '尚未选择报价库'}</span>
+          <div className="price-book-source-actions"><Button type="button" size="sm" variant="secondary" onPress={onPickSettlement}>选择结算价格表</Button><Button type="button" size="sm" variant="secondary" onPress={onPickQuote}>选择报价库</Button></div>
         </div>
-        {activeTab === 'settlement' && settlementBook ? (
+        {settlementBook ? (
           <div className="price-book-tab-panel" role="tabpanel">
             <div className="price-book-toolbar">
-              <div className="price-book-search"><Input value={query} onChange={(event) => onQueryChange(event.currentTarget.value)} placeholder="搜索分类、报告类别、计费项目或项目编号" /></div>
-              <Button type="button" size="sm" variant="primary" onPress={onSave} isDisabled={busy}>{busy ? '保存中' : '保存修改'}</Button>
+              <div className="price-book-search"><Input value={query} onChange={(event) => onQueryChange(event.currentTarget.value)} placeholder="搜索结算项目、计费项目编号、报价项目、材料或参数" /></div>
+              <Button type="button" size="sm" variant="primary" onPress={onSave} isDisabled={busy}>{busy ? '保存中' : '保存全部修改'}</Button>
             </div>
             <div className="price-book-table-wrap">
-              <table className="price-book-table">
-                <thead><tr><th>分类</th><th>报告类别</th><th>计费项目</th><th>项目编号</th>{settlementBook.systems.map((system) => <th className="num" key={system.name}>{system.name}</th>)}</tr></thead>
-                <tbody>{settlementRows.map((item) => <tr className="price-book-row" key={`${item.sheet}-${item.row_number}`} onClick={() => openSettlementEditor(item)}><td>{item.category || '-'}</td><td>{item.report_category || '-'}</td><td>{item.billing_item || '-'}</td><td>{item.code || '-'}</td>{settlementBook.systems.map((system) => <td className="num" key={system.name}>{item.prices[system.name] ?? '-'}</td>)}</tr>)}{!settlementRows.length && <tr><td className="empty" colSpan={4 + settlementBook.systems.length}>没有符合条件的价格项目</td></tr>}</tbody>
-              </table>
-            </div>
-          </div>
-        ) : activeTab === 'quote' ? (
-          <div className="price-book-tab-panel" role="tabpanel">
-            <div className="price-book-toolbar">
-              <div className="price-book-search"><Input value={query} onChange={(event) => onQueryChange(event.currentTarget.value)} placeholder="搜索分类、检测材料、检测参数或报价编号" /></div>
-              <Button type="button" size="sm" variant="primary" onPress={onSave} isDisabled={busy || !quoteBook.length}>{busy ? '保存中' : '保存修改'}</Button>
-            </div>
-            <div className="price-book-table-wrap">
-              <table className="price-book-table quote-price-book-table">
-                <thead><tr><th>分类</th><th>检测材料</th><th>检测参数</th><th>单位</th><th className="num">单价（元）</th><th>备注</th><th>报价编号</th></tr></thead>
-                <tbody>{quoteRows.map((item) => <tr className="price-book-row" key={`${item.sheet}-${item.row_number}`} onClick={() => openQuoteEditor(item)}><td>{item.category || item.sheet}</td><td>{item.material || '-'}</td><td>{item.parameter || '-'}</td><td>{item.unit || '-'}</td><td className="num">{item.price ?? '-'}</td><td>{item.remark || '-'}</td><td>{item.code || '-'}</td></tr>)}{!quoteRows.length && <tr><td className="empty" colSpan={7}>没有符合条件的价格项目</td></tr>}</tbody>
+              <table className="price-book-table merged-price-book-table">
+                <thead><tr><th className="settlement-group" colSpan={4 + settlementBook.systems.length}>结算表数据</th><th className="quote-group" colSpan={6}>报价表数据</th></tr><tr><th className="settlement-column">分类</th><th className="settlement-column">报告类别</th><th className="settlement-column">计费项目</th><th className="settlement-column">计费项目编号</th>{settlementBook.systems.map((system) => <th className="num settlement-column" key={system.name}>{system.name}</th>)}<th className="quote-column quote-start">报价编号</th><th className="quote-column">检测项目（含别名）</th><th className="quote-column">检测材料</th><th className="quote-column">检测参数（含别名）</th><th className="num quote-column">报价单价</th><th className="quote-column">备注</th></tr></thead>
+                <tbody>{mergedRows.map(({ settlement, quotes }) => { const quote = quotes[0]; return <tr className="price-book-row" key={`${settlement.sheet}-${settlement.row_number}`} onClick={() => openMergedEditor(settlement, quote || null)}><td className="settlement-column">{settlement.category || '-'}</td><td className="settlement-column">{settlement.report_category || '-'}</td><td className="settlement-column">{settlement.billing_item || '-'}</td><td className="settlement-column">{settlement.code || '-'}</td>{settlementBook.systems.map((system) => <td className="num settlement-column" key={system.name}>{settlement.prices[system.name] ?? '-'}</td>)}<td className="quote-column quote-start">{quote?.code || settlement.code || '-'}</td><td className="quote-column">{[quote?.category, quote?.project_aliases?.join('、')].filter(Boolean).join('、') || '-'}</td><td className="quote-column">{quote?.material || '-'}</td><td className="quote-column">{[quote?.parameter, quote?.parameter_aliases?.join('、')].filter(Boolean).join('、') || '-'}</td><td className="num quote-column">{quote?.price ?? '-'}</td><td className="quote-column">{quote?.remark || '-'}</td></tr> })}{!mergedRows.length && <tr><td className="empty" colSpan={10 + settlementBook.systems.length}>没有符合条件的价格项目</td></tr>}</tbody>
               </table>
             </div>
           </div>
         ) : <div className="price-book-loading">{busy ? '正在读取价格文件…' : '请先选择对应的 Excel 价格文件'}</div>}
       </Card>
-      {editing && <div className="price-edit-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeEditor() }}><section className="price-edit-dialog" role="dialog" aria-modal="true" aria-label="编辑价格"><div className="price-edit-head"><div><h2>编辑价格</h2><p>{editingTitle()}</p></div><Button type="button" size="sm" variant="secondary" onPress={closeEditor}>关闭</Button></div><div className="price-edit-body">{editing.kind === 'settlement' && settlementBook ? <>{settlementBook.systems.map((system) => <label className="price-edit-field" key={system.name}><span>{system.name}</span><Input inputMode="decimal" value={draftPrices[system.name] ?? ''} onChange={(event) => { const value = event.currentTarget.value; if (/^-?\d*(?:\.\d*)?$/.test(value)) setDraftPrices((draft) => ({ ...draft, [system.name]: value })) }} placeholder="留空表示无价格" /></label>)}</> : <><label className="price-edit-field"><span>单价（元）</span><Input inputMode="decimal" value={draftPrices.quote ?? ''} onChange={(event) => { const value = event.currentTarget.value; if (/^-?\d*(?:\.\d*)?$/.test(value)) setDraftPrices((draft) => ({ ...draft, quote: value })) }} /></label><label className="price-edit-field"><span>备注</span><Input value={draftRemark} onChange={(event) => setDraftRemark(event.currentTarget.value)} /></label></>}<div className="price-edit-footer"><Button type="button" variant="secondary" onPress={closeEditor}>取消</Button><Button type="button" variant="primary" onPress={applyEditor}>确认修改</Button></div></div></section></div>}
+      {editing && <div className="price-edit-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeEditor() }}><section className="price-edit-dialog" role="dialog" aria-modal="true" aria-label="编辑统一项目价格"><div className="price-edit-head"><div><h2>编辑统一项目价格</h2><p>{editingTitle()}</p></div><Button type="button" size="sm" variant="secondary" onPress={closeEditor}>关闭</Button></div><div className="price-edit-body"><div className="price-edit-section"><h3>结算表价格</h3>{settlementBook?.systems.map((system) => <label className="price-edit-field" key={system.name}><span>{system.name}</span><Input inputMode="decimal" value={draftPrices[system.name] ?? ''} onChange={(event) => { const value = event.currentTarget.value; if (/^-?\d*(?:\.\d*)?$/.test(value)) setDraftPrices((draft) => ({ ...draft, [system.name]: value })) }} placeholder="留空表示无价格" /></label>)}</div><div className="price-edit-section"><h3>报价表字段</h3>{editing.quote ? <><div className="price-edit-edit-grid"><label className="price-edit-field"><span>报价编号</span><Input value={draftQuote.code} onChange={(event) => setDraftQuote((draft) => ({ ...draft, code: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>序号</span><Input value={draftQuote.seq} onChange={(event) => setDraftQuote((draft) => ({ ...draft, seq: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>检测项目</span><Input value={draftQuote.category} onChange={(event) => setDraftQuote((draft) => ({ ...draft, category: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>检测材料</span><Input value={draftQuote.material} onChange={(event) => setDraftQuote((draft) => ({ ...draft, material: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>检测参数</span><Input value={draftQuote.parameter} onChange={(event) => setDraftQuote((draft) => ({ ...draft, parameter: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>单位</span><Input value={draftQuote.unit} onChange={(event) => setDraftQuote((draft) => ({ ...draft, unit: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>检测项目别名</span><Input value={draftQuote.projectAliases} onChange={(event) => setDraftQuote((draft) => ({ ...draft, projectAliases: event.currentTarget.value }))} /></label><label className="price-edit-field"><span>检测参数别名</span><Input value={draftQuote.parameterAliases} onChange={(event) => setDraftQuote((draft) => ({ ...draft, parameterAliases: event.currentTarget.value }))} /></label></div><label className="price-edit-field"><span>报价单价（元）</span><Input inputMode="decimal" value={draftPrices.quote ?? ''} onChange={(event) => { const value = event.currentTarget.value; if (/^-?\d*(?:\.\d*)?$/.test(value)) setDraftPrices((draft) => ({ ...draft, quote: value })) }} placeholder="留空表示无价格" /></label><label className="price-edit-field"><span>报价备注</span><Input value={draftRemark} onChange={(event) => setDraftRemark(event.currentTarget.value)} /></label></> : <p className="price-edit-empty">未找到对应报价表项目，仅可修改结算表价格。</p>}</div><div className="price-edit-footer"><Button type="button" variant="secondary" onPress={closeEditor}>取消</Button><Button type="button" variant="primary" onPress={applyEditor}>确认修改</Button></div></div></section></div>}
     </section>
   )
 }
@@ -1013,6 +1133,45 @@ function SettlementEditDialog({
   )
 }
 
+function CorrespondenceDialog({
+  row,
+  onClose,
+}: {
+  row: RecordRow
+  onClose: () => void
+}) {
+  return (
+    <div className="manual-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="correspondence-dialog" role="dialog" aria-modal="true" aria-label="报价结算对应关系">
+        <div className="manual-head">
+          <div className="manual-head-main">
+            <h2>报价结算对应</h2>
+            <div className="manual-context"><span>报告编号：{row.report_number || '-'}</span><span>zc计费项目：{row.billing_item || '-'}</span></div>
+          </div>
+          <Button type="button" size="sm" variant="secondary" onPress={onClose}>关闭</Button>
+        </div>
+        <div className="correspondence-flow">
+          <CorrespondenceCard title="zc台账" rows={[
+            ['报告类别', row.report_category], ['计费项目', row.billing_item], ['数量', row.quantity], ['台账单价', fmtMoney(row.source_unit_price)],
+          ]} />
+          <div className="correspondence-arrow">→</div>
+          <CorrespondenceCard title="结算表" rows={[
+            ['报告类别', row.report_category], ['计费项目', row.billing_item], ['计费项目编号', row.matched_code], ['价格体系', row.selected_system], ['结算单价', fmtMoney(row.selected_price)], ['结算金额', fmtMoney(row.settlement_amount)],
+          ]} />
+          <div className="correspondence-arrow">→</div>
+          <CorrespondenceCard title="检测报价表" rows={[
+            ['报价编号', row.quote_code || '-'], ['检测项目（含别名）', joinDistinct(row.quote_project, row.quote_project_alias) || '-'], ['检测材料', row.quote_material || '-'], ['检测参数（含别名）', joinDistinct(row.quote_parameter, row.quote_parameter_alias) || '-'], ['报价单价', fmtMoney(row.quote_price)], ['报价备注', row.quote_remark || '-'], ['关联状态', row.quote_status || '-'],
+          ]} />
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function CorrespondenceCard({ title, rows }: { title: string; rows: Array<[string, string | number | null]> }) {
+  return <section className="correspondence-card"><h3>{title}</h3><dl>{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value === null || value === '' ? '-' : value}</dd></div>)}</dl></section>
+}
+
 function QuoteMatchDialog({
   candidates,
   mode,
@@ -1038,6 +1197,9 @@ function QuoteMatchDialog({
   onClose: () => void
   onSelect: (item: QuotePriceItem) => void
 }) {
+  const itemKey = (item: QuotePriceItem) => `${item.sheet}:${item.row_number}`
+  const [selectedKey, setSelectedKey] = useState(row.matched ? itemKey(row.matched) : '')
+  const selectedItem = candidates.find((item) => itemKey(item) === selectedKey)
   return (
     <div className="manual-overlay" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose()
@@ -1073,7 +1235,7 @@ function QuoteMatchDialog({
             </div>
             <div className="manual-table-info">
               <span>检测报价表</span>
-              <small>显示 {candidates.length} 项，点击行或“选择”完成匹配</small>
+              <small>显示 {candidates.length} 项，选择一行后确认匹配</small>
             </div>
             <div className="manual-price-table-wrap">
               <table className="manual-price-table">
@@ -1088,13 +1250,20 @@ function QuoteMatchDialog({
                     <th className="num">单价（元）</th>
                     <th>备注</th>
                     <th>报价编号</th>
+                    <th>检测项目别名</th>
+                    <th>检测参数别名</th>
                     <th className="num">分数</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {candidates.map((item) => (
-                    <tr className="manual-price-row" key={`${item.sheet}-${item.row_number}`} onClick={() => onSelect(item)}>
+                    <tr
+                      aria-selected={itemKey(item) === selectedKey}
+                      className={`manual-price-row ${itemKey(item) === selectedKey ? 'selected' : ''}`}
+                      key={`${item.sheet}-${item.row_number}`}
+                      onClick={() => setSelectedKey(itemKey(item))}
+                    >
                       <td>{item.seq}</td>
                       <td>{item.sheet}</td>
                       <td>{item.category || '-'}</td>
@@ -1104,15 +1273,26 @@ function QuoteMatchDialog({
                       <td className="num manual-price-cell">{item.raw_price || fmtMoney(item.price)}</td>
                       <td className="wide">{item.remark || '-'}</td>
                       <td>{item.code || '-'}</td>
+                      <td className="wide">{item.project_aliases.join(' / ') || '-'}</td>
+                      <td className="wide">{item.parameter_aliases.join(' / ') || '-'}</td>
                       <td className="num">{item.score}</td>
                       <td>
-                        <Button type="button" size="sm" variant="primary" onPress={() => onSelect(item)}>选择</Button>
+                        <Button type="button" size="sm" variant={itemKey(item) === selectedKey ? 'primary' : 'secondary'} onPress={() => setSelectedKey(itemKey(item))}>
+                          {itemKey(item) === selectedKey ? '已选' : '选择'}
+                        </Button>
                       </td>
                     </tr>
                   ))}
-                  {!candidates.length && <tr><td className="manual-empty" colSpan={11}>没有找到匹配的报价项目</td></tr>}
+                  {!candidates.length && <tr><td className="manual-empty" colSpan={13}>没有找到匹配的报价项目</td></tr>}
                 </tbody>
               </table>
+            </div>
+            <div className="quote-picker-actions">
+              <span>{selectedItem ? `已选择：${selectedItem.category || selectedItem.sheet} / ${selectedItem.parameter}` : '请选择一条报价项目'}</span>
+              <div>
+                <Button type="button" size="sm" variant="secondary" onPress={onClose}>取消</Button>
+                <Button type="button" size="sm" variant="primary" isDisabled={!selectedItem} onPress={() => { if (selectedItem) onSelect(selectedItem) }}>确认匹配并回填别名</Button>
+              </div>
             </div>
           </section>
         </div>

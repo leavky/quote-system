@@ -46,6 +46,17 @@ export type RecordRow = {
   available_prices: Record<string, number | null>
   candidate_count: number
   manual_match: boolean
+  quote_code: string
+  quote_sheet: string
+  quote_row_number: number | null
+  quote_project: string
+  quote_material: string
+  quote_parameter: string
+  quote_project_alias: string
+  quote_parameter_alias: string
+  quote_price: number | null
+  quote_remark: string
+  quote_status: string
 }
 export type MatchResult = {
   ledger_headers: string[]
@@ -57,6 +68,7 @@ export type MatchResult = {
   manual_edits: ManualSettlementEdit[]
   records: RecordRow[]
   summary: Summary
+  quote_items: QuoteLinkItem[]
 }
 export type MatchPayload = {
   ledger_name: string
@@ -66,6 +78,7 @@ export type MatchPayload = {
   summary: Summary
   records: RecordRow[]
   result: MatchResult
+  quote_name: string
 }
 
 type SheetData = { name: string; rows: CellValue[][] }
@@ -81,6 +94,17 @@ type LedgerRecord = Omit<
   | 'available_prices'
   | 'candidate_count'
   | 'manual_match'
+  | 'quote_code'
+  | 'quote_sheet'
+  | 'quote_row_number'
+  | 'quote_project'
+  | 'quote_material'
+  | 'quote_parameter'
+  | 'quote_project_alias'
+  | 'quote_parameter_alias'
+  | 'quote_price'
+  | 'quote_remark'
+  | 'quote_status'
 >
 export type PriceItem = {
   sheet: string
@@ -92,6 +116,20 @@ export type PriceItem = {
   category: string
   prices: Record<string, number | null>
   raw_prices: Record<string, CellValue>
+}
+
+type QuoteLinkItem = {
+  sheet: string
+  row_number: number
+  code: string
+  project: string
+  material: string
+  parameter: string
+  project_alias: string
+  parameter_alias: string
+  unit: string
+  price: number | null
+  remark: string
 }
 
 const LEDGER_HINTS = new Set(['委托日期', '报告编号', '报告类别', '工程名称', '计费项目', '数量'])
@@ -125,9 +163,22 @@ const LEDGER_EXPORT_HEADERS = [
   '备注',
   '所属质监站',
 ]
+const LINK_EXPORT_COLUMNS = [
+  '计费项目编号',
+  '结算价格体系',
+  '结算单价',
+  '结算金额',
+  '报价编号',
+  '报价检测项目（含别名）',
+  '报价检测材料',
+  '报价检测参数（含别名）',
+  '报价单价',
+  '报价备注',
+  '报价关联状态',
+]
 
-export async function buildMatchPayload(ledgerPath: string, pricePath: string): Promise<MatchPayload> {
-  const result = await buildMatchResult(ledgerPath, pricePath)
+export async function buildMatchPayload(ledgerPath: string, pricePath: string, quotePath = ''): Promise<MatchPayload> {
+  const result = await buildMatchResult(ledgerPath, pricePath, quotePath)
   return {
     ledger_name: basename(ledgerPath),
     price_name: basename(pricePath),
@@ -136,6 +187,7 @@ export async function buildMatchPayload(ledgerPath: string, pricePath: string): 
     summary: result.summary,
     records: result.records,
     result,
+    quote_name: quotePath ? basename(quotePath) : '',
   }
 }
 
@@ -145,7 +197,7 @@ export async function loadSettlementPriceBook(path: string): Promise<{ items: Pr
 
 export async function updateSettlementPriceBook(
   path: string,
-  updates: Array<{ sheet: string; row_number: number; prices: Record<string, number | null> }>,
+  updates: Array<{ sheet: string; row_number: number; code?: string; prices: Record<string, number | null> }>,
 ): Promise<number> {
   const bytes = await readFile(path)
   const workbook = new ExcelJS.Workbook()
@@ -163,6 +215,16 @@ export async function updateSettlementPriceBook(
     })
     const row = sheet.getRow(update.row_number)
     let rowChanged = false
+    if (update.code !== undefined) {
+      const codeColumn = headers.get('计费项目编号')
+      if (codeColumn) {
+        const cell = row.getCell(codeColumn)
+        if (cell.value !== update.code) {
+          cell.value = update.code
+          rowChanged = true
+        }
+      }
+    }
     Object.entries(update.prices).forEach(([system, value]) => {
       const column = headers.get(system)
       if (!column) return
@@ -184,7 +246,7 @@ export async function updateSettlementPriceBook(
 
 export function repricePayload(payload: MatchPayload, requestedPriority: PriorityEntry[]): MatchPayload {
   const priority = normalizePriority(payload.result.systems, requestedPriority)
-  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, priority, payload.result.manual_matches, payload.result.manual_edits)
+  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, priority, payload.result.manual_matches, payload.result.manual_edits, indexQuoteItems(payload.result.quote_items))
   const result = { ...payload.result, priority, records, summary: summarize(records) }
   return { ...payload, priority, records, summary: result.summary, result }
 }
@@ -195,7 +257,7 @@ export function applyManualMatch(payload: MatchPayload, rowId: string, priceItem
     { row_id: rowId, price_sheet: priceItem.sheet, price_row_number: priceItem.row_number },
   ]
   const priority = normalizePriority(payload.result.systems, requestedPriority)
-  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, priority, manualMatches, payload.result.manual_edits)
+  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, priority, manualMatches, payload.result.manual_edits, indexQuoteItems(payload.result.quote_items))
   const result = { ...payload.result, priority, manual_matches: manualMatches, records, summary: summarize(records) }
   return { ...payload, priority, records, summary: result.summary, result }
 }
@@ -205,7 +267,7 @@ export function applyManualSettlementEdit(payload: MatchPayload, edit: ManualSet
     ...payload.result.manual_edits.filter((item) => item.row_id !== edit.row_id),
     edit,
   ]
-  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, payload.result.priority, payload.result.manual_matches, manualEdits)
+  const records = matchRecords(payload.result.ledger_records, payload.result.price_items, payload.result.priority, payload.result.manual_matches, manualEdits, indexQuoteItems(payload.result.quote_items))
   const result = { ...payload.result, manual_edits: manualEdits, records, summary: summarize(records) }
   return { ...payload, records, summary: result.summary, result }
 }
@@ -214,34 +276,69 @@ export async function exportResult(payload: MatchPayload, outputPath: string, ro
   const selectedIds = new Set(rowIds)
   const records = payload.result.records.filter((record) => selectedIds.has(record.id))
   const columns = buildLedgerExportColumns(payload.result.ledger_headers)
+  const linkColumns = LINK_EXPORT_COLUMNS.map((label) => ({ key: `__${label}`, label }))
+  const allColumns = [...columns, ...linkColumns]
   const manualEditIndex = new Map(payload.result.manual_edits.map((edit) => [edit.row_id, edit]))
   const workbook = new ExcelJS.Workbook()
   workbook.creator = '项目结算价格匹配'
   workbook.created = new Date()
 
   const detailSheet = workbook.addWorksheet('台账明细', {
-    views: [{ state: 'frozen', ySplit: 1, showGridLines: false }],
+    views: [{ state: 'frozen', ySplit: 2, showGridLines: false }],
   })
 
-  columns.forEach((column, index) => {
-    detailSheet.getRow(1).getCell(index + 1).value = column.label
+  const sourceColumnCount = columns.length
+  const settlementLinkCount = 4
+  const groupRanges = [
+    { label: 'zc台账数据', start: 1, end: sourceColumnCount },
+    { label: '结算表数据', start: sourceColumnCount + 1, end: sourceColumnCount + settlementLinkCount },
+    { label: '报价表数据', start: sourceColumnCount + settlementLinkCount + 1, end: allColumns.length },
+  ]
+  groupRanges.forEach((group) => {
+    detailSheet.mergeCells(1, group.start, 1, group.end)
+    const cell = detailSheet.getCell(1, group.start)
+    cell.value = group.label
+    cell.font = { name: 'Microsoft YaHei', size: 10, bold: true, color: { argb: 'FF17324D' } }
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC7D7E8' } }
+    cell.alignment = { horizontal: 'center', vertical: 'middle' }
   })
-  detailSheet.getRow(1).height = 28
-  detailSheet.getRow(1).eachCell((cell) => {
+  detailSheet.getRow(1).height = 24
+  allColumns.forEach((column, index) => {
+    detailSheet.getRow(2).getCell(index + 1).value = column.label
+  })
+  detailSheet.getRow(2).height = 28
+  detailSheet.getRow(2).eachCell((cell) => {
     cell.font = { name: 'Microsoft YaHei', size: 10, bold: true, color: { argb: 'FF17324D' } }
     cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDCE6F1' } }
     cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }
     cell.border = { bottom: { style: 'thin', color: { argb: 'FFB8C4CE' } } }
   })
 
-  const columnIndex = Object.fromEntries(columns.map((column, index) => [column.key, index + 1]))
+  const columnIndex = Object.fromEntries(allColumns.map((column, index) => [column.key, index + 1]))
   records.forEach((record, index) => {
-    const rowIndex = index + 2
+    const rowIndex = index + 3
     const row = detailSheet.getRow(rowIndex)
     columns.forEach((column, exportColumnIndex) => {
       const cell = row.getCell(exportColumnIndex + 1)
       cell.value = safeExcelValue(record.original[column.key])
       if (cell.value instanceof Date) cell.numFmt = 'yyyy-mm-dd'
+    })
+    const linkValues: Record<string, CellValue> = {
+      __计费项目编号: record.matched_code,
+      __结算价格体系: record.selected_system,
+      __结算单价: record.selected_price,
+      __结算金额: record.settlement_amount,
+      __报价编号: record.quote_code,
+      ['__报价检测项目（含别名）']: joinDistinct(record.quote_project, record.quote_project_alias),
+      ['__报价检测材料']: record.quote_material,
+      ['__报价检测参数（含别名）']: joinDistinct(record.quote_parameter, record.quote_parameter_alias),
+      ['__报价单价']: record.quote_price,
+      ['__报价备注']: record.quote_remark,
+      ['__报价关联状态']: record.quote_status,
+    }
+    linkColumns.forEach((column, linkIndex) => {
+      const cell = row.getCell(columns.length + linkIndex + 1)
+      cell.value = safeExcelValue(linkValues[column.key])
     })
     if (record.status === '已匹配' && record.selected_price !== null) {
       const manualEdit = manualEditIndex.get(record.id)
@@ -271,10 +368,10 @@ export async function exportResult(payload: MatchPayload, outputPath: string, ro
     column.alignment = { horizontal: 'right', vertical: 'middle' }
   }
   detailSheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: Math.max(1, records.length + 1), column: columns.length },
+    from: { row: 2, column: 1 },
+    to: { row: Math.max(2, records.length + 2), column: allColumns.length },
   }
-  columns.forEach((column, index) => {
+  allColumns.forEach((column, index) => {
     detailSheet.getColumn(index + 1).width = columnWidth(column.label, records)
   })
 
@@ -283,13 +380,14 @@ export async function exportResult(payload: MatchPayload, outputPath: string, ro
   return records.length
 }
 
-async function buildMatchResult(ledgerPath: string, pricePath: string): Promise<MatchResult> {
+async function buildMatchResult(ledgerPath: string, pricePath: string, quotePath = ''): Promise<MatchResult> {
   const ledger = await readLedger(ledgerPath)
   const priceBook = await readPriceBook(pricePath)
+  const quoteBook = quotePath ? await readQuoteLinkBook(quotePath) : new Map<string, QuoteLinkItem[]>()
   const priority = normalizePriority(priceBook.systems)
   const manualMatches: ManualMatch[] = []
   const manualEdits: ManualSettlementEdit[] = []
-  const records = matchRecords(ledger.records, priceBook.items, priority, manualMatches, manualEdits)
+  const records = matchRecords(ledger.records, priceBook.items, priority, manualMatches, manualEdits, quoteBook)
   return {
     ledger_headers: ledger.headers,
     ledger_records: ledger.records,
@@ -300,6 +398,7 @@ async function buildMatchResult(ledgerPath: string, pricePath: string): Promise<
     manual_edits: manualEdits,
     records,
     summary: summarize(records),
+    quote_items: Array.from(quoteBook.values()).flat(),
   }
 }
 
@@ -377,11 +476,15 @@ async function readPriceBook(path: string): Promise<{ items: PriceItem[]; system
       sheetSystems.push([name, columnIndex])
     }
 
+    let reportCategory = ''
+    let billingItem = ''
+    let category = ''
     sheet.rows.slice(headerIndex + 1).forEach((values, offset) => {
       const rowNumber = headerIndex + offset + 2
       const row = rowObject(headers, values)
-      const reportCategory = cellText(row['报告类别'])
-      const billingItem = cellText(row['计费项目'])
+      reportCategory = cellText(row['报告类别']) || reportCategory
+      billingItem = cellText(row['计费项目']) || billingItem
+      category = cellText(row['分类']) || category
       if (!reportCategory && !billingItem) return
       const prices: Record<string, number | null> = {}
       const rawPrices: Record<string, CellValue> = {}
@@ -398,7 +501,7 @@ async function readPriceBook(path: string): Promise<{ items: PriceItem[]; system
         report_category: reportCategory,
         billing_item: billingItem,
         code: cellText(row['计费项目编号']),
-        category: cellText(row['分类']),
+        category,
         prices,
         raw_prices: rawPrices,
       })
@@ -410,12 +513,53 @@ async function readPriceBook(path: string): Promise<{ items: PriceItem[]; system
   return { items, systems }
 }
 
+async function readQuoteLinkBook(path: string): Promise<Map<string, QuoteLinkItem[]>> {
+  const index = new Map<string, QuoteLinkItem[]>()
+  for (const sheet of await readSheets(path)) {
+    const headerIndex = findHeaderRow(sheet.rows, new Set(['报价编号', '检测项目', '检测参数']))
+    if (headerIndex === null) continue
+    const headers = uniqueHeaders(sheet.rows[headerIndex])
+    let project = ''
+    let material = ''
+    for (let offset = headerIndex + 1; offset < sheet.rows.length; offset += 1) {
+      const rowNumber = offset + 1
+      const raw = rowObject(headers, sheet.rows[offset])
+      project = cellText(raw['检测项目']) || project
+      material = cellText(raw['检测材料']) || material
+      const code = exactKey(raw['报价编号'])
+      if (!code) continue
+      const item: QuoteLinkItem = {
+        sheet: sheet.name,
+        row_number: rowNumber,
+        code,
+        project,
+        material: cellText(raw['检测材料']) || material,
+        parameter: cellText(raw['检测参数']),
+        project_alias: cellText(raw['检测项目别名']),
+        parameter_alias: cellText(raw['检测参数别名']),
+        unit: cellText(raw['单位']),
+        price: numberValue(raw['单价（元）'] ?? raw['单价']),
+        remark: cellText(raw['备注']),
+      }
+      index.set(code, [...(index.get(code) || []), item])
+    }
+  }
+  return index
+}
+
+function indexQuoteItems(items: QuoteLinkItem[]): Map<string, QuoteLinkItem[]> {
+  const index = new Map<string, QuoteLinkItem[]>()
+  items.forEach((item) => index.set(item.code, [...(index.get(item.code) || []), item]))
+  return index
+}
+
 function matchRecords(
   ledgerRecords: LedgerRecord[],
   priceItems: PriceItem[],
   priority: PriorityEntry[],
   manualMatches: ManualMatch[],
   manualEdits: ManualSettlementEdit[] = [],
+  quoteIndex: Map<string, QuoteLinkItem[]> = new Map(),
 ): RecordRow[] {
   const priceIndex = new Map<string, PriceItem[]>()
   priceItems.forEach((item) => {
@@ -478,6 +622,15 @@ function matchRecords(
     const amount = manualEdit
       ? manualEdit.total
       : selectedPrice !== null && quantity !== null ? round2(selectedPrice * quantity) : null
+    const quoteMatches = selectedItem?.code ? quoteIndex.get(exactKey(selectedItem.code)) || [] : []
+    const quoteItem = quoteMatches.length === 1 ? quoteMatches[0] : null
+    const quoteStatus = !selectedItem?.code
+      ? '结算编号缺失'
+      : quoteMatches.length === 1
+        ? '已关联'
+        : quoteMatches.length === 0
+          ? '报价编号未找到'
+          : '报价编号重复'
     return {
       ...source,
       status,
@@ -491,6 +644,17 @@ function matchRecords(
       candidate_count: candidates.length,
       manual_match: Boolean(manualItem || manualEdit),
       quantity,
+      quote_code: selectedItem?.code || '',
+      quote_sheet: quoteItem?.sheet || '',
+      quote_row_number: quoteItem?.row_number || null,
+      quote_project: quoteItem?.project || '',
+      quote_material: quoteItem?.material || '',
+      quote_parameter: quoteItem?.parameter || '',
+      quote_project_alias: quoteItem?.project_alias || '',
+      quote_parameter_alias: quoteItem?.parameter_alias || '',
+      quote_price: quoteItem?.price ?? null,
+      quote_remark: quoteItem?.remark || '',
+      quote_status: quoteStatus,
     }
   })
 }
@@ -527,6 +691,10 @@ function cellText(value: CellValue): string {
   if (value instanceof Date) return value.toISOString().slice(0, 19).replace('T', ' ')
   if (typeof value === 'number' && Number.isInteger(value)) return String(value)
   return String(value).trim()
+}
+
+function joinDistinct(primary: string, alias: string): string {
+  return Array.from(new Set([primary, alias].map((value) => value.trim()).filter(Boolean))).join('、')
 }
 
 function exactKey(value: CellValue): string {

@@ -10,6 +10,7 @@
     "desktop:build": "tauri build",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test:quote": "node --experimental-strip-types --experimental-test-module-mocks --test tests/quoteMatch.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

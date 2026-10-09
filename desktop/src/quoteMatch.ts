@@ -84,6 +84,13 @@ export type QuoteMatchPayload = {
   }
 }
 
+export type QuoteAliasLearnResult = {
+  updated: boolean
+  message: string
+  project_aliases: string[]
+  parameter_aliases: string[]
+}
+
 const PRICE_COLUMNS = new Set([
   '序号',
   '检测项目',
@@ -113,7 +120,20 @@ export async function loadQuotePriceBook(path: string): Promise<QuotePriceItem[]
 
 export async function updateQuotePriceBook(
   path: string,
-  updates: Array<{ sheet: string; row_number: number; price: number | null; remark?: string }>,
+  updates: Array<{
+    sheet: string
+    row_number: number
+    seq?: string
+    code?: string
+    category?: string
+    material?: string
+    parameter?: string
+    unit?: string
+    price: number | null
+    remark?: string
+    project_aliases?: string[]
+    parameter_aliases?: string[]
+  }>,
 ): Promise<number> {
   const bytes = await readFile(path)
   const workbook = new ExcelJS.Workbook()
@@ -128,6 +148,22 @@ export async function updateQuotePriceBook(
     const priceColumn = located.headers.get('单价（元）') || located.headers.get('单价')
     const remarkColumn = located.headers.get('备注')
     let rowChanged = false
+    const writeCell = (column: number | undefined, value: string | number | null) => {
+      if (!column) return
+      const cell = row.getCell(column)
+      if (cell.value !== value) {
+        cell.value = value
+        rowChanged = true
+      }
+    }
+    if (update.seq !== undefined) writeCell(located.headers.get('序号'), update.seq)
+    if (update.code !== undefined) writeCell(located.headers.get('报价编号'), update.code)
+    if (update.category !== undefined) writeCell(located.headers.get('检测项目'), update.category)
+    if (update.material !== undefined) writeCell(located.headers.get('检测材料'), update.material)
+    if (update.parameter !== undefined) writeCell(located.headers.get('检测参数'), update.parameter)
+    if (update.unit !== undefined) writeCell(located.headers.get('单位'), update.unit)
+    if (update.project_aliases !== undefined) writeCell(located.headers.get('检测项目别名'), update.project_aliases.join('/'))
+    if (update.parameter_aliases !== undefined) writeCell(located.headers.get('检测参数别名'), update.parameter_aliases.join('/'))
     if (priceColumn) {
       const cell = row.getCell(priceColumn)
       const next = update.price === null ? null : update.price
@@ -160,11 +196,33 @@ export function applyQuoteManualMatch(payload: QuoteMatchPayload, matchId: strin
   return makePayload(payload.quote_name, payload.price_name, payload.price_items, matches, true)
 }
 
-export function markQuoteAliasLearned(payload: QuoteMatchPayload, matchId: string, result: { updated: boolean; message: string }): QuoteMatchPayload {
-  const matches = payload.matches.map((match) => (
-    match.id === matchId ? { ...match, alias_learned: result.updated, alias_message: result.message } : match
-  ))
-  return makePayload(payload.quote_name, payload.price_name, payload.price_items, matches, true)
+export function markQuoteAliasLearned(
+  payload: QuoteMatchPayload,
+  matchId: string,
+  selectedItem: QuotePriceItem,
+  result: QuoteAliasLearnResult,
+): QuoteMatchPayload {
+  const sameItem = (item: QuotePriceItem) => item.sheet === selectedItem.sheet && item.row_number === selectedItem.row_number
+  const updateItem = (item: QuotePriceItem): QuotePriceItem => {
+    if (!sameItem(item)) return item
+    const projectAliases = result.project_aliases.length ? result.project_aliases : item.project_aliases
+    const parameterAliases = result.parameter_aliases.length ? result.parameter_aliases : item.parameter_aliases
+    return {
+      ...item,
+      project_aliases: projectAliases,
+      parameter_aliases: parameterAliases,
+      aliases: [...projectAliases, ...parameterAliases],
+      search_text: [item.sheet, item.category, item.material, item.parameter, ...projectAliases, ...parameterAliases].join(' '),
+    }
+  }
+  const priceItems = payload.price_items.map(updateItem)
+  const matches = payload.matches.map((match) => ({
+    ...match,
+    ...(match.id === matchId ? { alias_learned: result.updated, alias_message: result.message } : {}),
+    matched: match.matched ? updateItem(match.matched) : null,
+    top_candidates: match.top_candidates.map((candidate) => ({ ...candidate, item: updateItem(candidate.item) })),
+  }))
+  return makePayload(payload.quote_name, payload.price_name, priceItems, matches, true)
 }
 
 export async function appendQuotePriceAliases(
@@ -172,7 +230,7 @@ export async function appendQuotePriceAliases(
   item: QuotePriceItem,
   projectAlias: string,
   parameterAlias: string,
-): Promise<{ updated: boolean; message: string; project_aliases: string[]; parameter_aliases: string[] }> {
+): Promise<QuoteAliasLearnResult> {
   const bytes = await readFile(path)
   const workbook = new ExcelJS.Workbook()
   await workbook.xlsx.load(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
@@ -263,6 +321,42 @@ export async function exportQuoteMatches(payload: QuoteMatchPayload, outputPath:
   return payload.matches.length
 }
 
+export async function backfillQuoteWorkbook(quotePath: string, payload: QuoteMatchPayload, outputPath: string): Promise<number> {
+  const bytes = await readFile(quotePath)
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
+  let changed = 0
+
+  for (const match of payload.matches) {
+    if (!match.matched) continue
+    const sheet = workbook.getWorksheet(match.sheet)
+    if (!sheet) continue
+    const located = findHeaderCells(sheet, QUOTE_HINT_COLUMNS)
+    if (!located || match.row_number <= located.headerRow || match.row_number > sheet.rowCount) continue
+
+    const unitPriceColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['单价（元）', '单价'], '单价')
+    const totalColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['合价（元）', '合价'], '合价')
+    const remarkColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['备注'], '备注')
+    const codeColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['报价编号'], '报价编号')
+    const statusColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['匹配状态'], '匹配状态')
+    const methodColumn = ensureOutputColumn(sheet, located.headerRow, located.headers, ['匹配方法'], '匹配方法')
+    const row = sheet.getRow(match.row_number)
+
+    row.getCell(unitPriceColumn).value = match.matched_price ?? match.matched_price_text ?? ''
+    row.getCell(totalColumn).value = match.calculated_total
+    row.getCell(remarkColumn).value = mergeBackfillRemark(match.remark, match.matched.remark || match.matched_remark || '')
+    row.getCell(codeColumn).value = match.matched_code || match.matched.code || ''
+    row.getCell(statusColumn).value = match.manual_confirmed ? '手动确认' : match.match_status
+    row.getCell(methodColumn).value = match.match_method
+    row.commit()
+    changed += 1
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer()
+  await writeFile(outputPath, new Uint8Array(buffer))
+  return changed
+}
+
 export async function createQuoteImportTemplate(outputPath: string): Promise<void> {
   const workbook = new ExcelJS.Workbook()
   const info = workbook.addWorksheet('填写说明', { views: [{ showGridLines: false }] })
@@ -323,7 +417,7 @@ async function readQuotePriceBook(path: string): Promise<QuotePriceItem[]> {
       material = cellText(raw['检测材料']) || material
       const parameter = cellText(raw['检测参数'])
       const rawPrice = cellText(raw['单价（元）'] ?? raw['单价'])
-      if (!parameter || !rawPrice) continue
+      if (!parameter) continue
       const projectAliases = splitAliases(raw['检测项目别名'])
       const parameterAliases = splitAliases(raw['检测参数别名'])
       const code = cellText(raw['报价编号'])
@@ -575,6 +669,31 @@ function findHeaderCells(sheet: ExcelJS.Worksheet, hints: Set<string>): { header
     }
   }
   return bestScore >= 2 ? { headerRow: bestRow, headers: bestHeaders } : null
+}
+
+function ensureOutputColumn(
+  sheet: ExcelJS.Worksheet,
+  headerRow: number,
+  headers: Map<string, number>,
+  candidates: string[],
+  fallback: string,
+): number {
+  for (const candidate of candidates) {
+    const existing = headers.get(candidate)
+    if (existing) return existing
+  }
+  const column = Math.max(sheet.columnCount, ...headers.values()) + 1
+  sheet.getCell(headerRow, column).value = fallback
+  headers.set(fallback, column)
+  return column
+}
+
+function mergeBackfillRemark(source: string, matched: string): string {
+  const sourceText = cellText(source)
+  const matchedText = cellText(matched)
+  if (!sourceText) return matchedText
+  if (!matchedText || compactText(sourceText).includes(compactText(matchedText))) return sourceText
+  return `${sourceText}；报价库：${matchedText}`
 }
 
 function appendAliasToColumn(
